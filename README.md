@@ -9,4 +9,4 @@ In this repository one may find the adaptation of the STABL algortithm to the CO
 
 ## Tutorial
 
-In a directory `notebooks` there is a `COXTABLE Tutorial.ipynb` notebook with an example on how to run the `coxtable` for a feature selection.
+In a directory `notebooks` there is a `COXTABL-Tutorial.ipynb` notebook with an example on how to run the `coxtable` for a feature selection.
