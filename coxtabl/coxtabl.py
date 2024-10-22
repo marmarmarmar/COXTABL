@@ -2,13 +2,16 @@ from collections import defaultdict
 from collections import namedtuple
 from typing import List
 from typing import Optional
+from typing import Union 
+import warnings
 
 import lifelines
 import matplotlib.pyplot as plt
 import numpy
 import pandas
-import tqdm
+import scipy
 import seaborn as sns
+import tqdm
 from sklearn.preprocessing import StandardScaler
 
 
@@ -39,8 +42,8 @@ def lasso_coxtabl_on_df(
     event_col: str = 'death',
     duration_col: str = 'days_to_death',
     data_cols: Optional[list] = None,
-    l1s_to_check: Optional[list] = None,
-    l2: float = 0.1,
+    lambdas: Optional[Union[list, int]] = 10,
+    alpha: float = 0.95,
     iters: int = 100,
     bootstrap_sample: float = 0.5,
     random_seed: int = 42,
@@ -53,8 +56,21 @@ def lasso_coxtabl_on_df(
         data_cols = [
             col for col in df.columns if col not in [event_col, duration_col]
         ]
-    if l1s_to_check is None:
-        l1s_to_check = numpy.logspace(-1, -1.5, 10)
+    
+    if standardize:
+        df = df.copy()
+        scaler = StandardScaler()
+        df[data_cols] = scaler.fit_transform(df[data_cols].values)
+
+    if isinstance(lambdas, int):
+        lambdas = get_optimal_lambdas(
+            times=df[duration_col].values,
+            events=df[event_col].values,
+            x=df[data_cols].values,
+            alpha=alpha,
+            n_lambda=lambdas,
+        )
+
     if cox_kwargs is None:
         cox_kwargs = {}
     if fit_kwargs is None:
@@ -63,7 +79,8 @@ def lasso_coxtabl_on_df(
     coxes = []
     l1_to_names_to_coefs = defaultdict(lambda: defaultdict(list))
     current_random_seed = random_seed
-
+    
+    warnings.filterwarnings('ignore')
     for _ in tqdm.tqdm(range(iters)):
         failed = True
         while failed:
@@ -81,15 +98,11 @@ def lasso_coxtabl_on_df(
                 iter_df = full_coxtabl_df.sample(frac=bootstrap_sample, random_state=current_random_seed)
                 current_random_seed += 1
 
-                for l1 in l1s_to_check:
-                    if standardize:
-                        iter_df = iter_df.copy()
-                        scaler = StandardScaler()
-                        iter_df[cox_features_cols] = scaler.fit_transform(iter_df[cox_features_cols].values)
-                    penalizer, l1_ratio = pen_l1_r_from_l1_l2(l1=l1, l2=l2)
+                for lambda_ in lambdas:
+                    print(lambda_)
                     current_cphf = lifelines.CoxPHFitter(
-                        penalizer=penalizer,
-                        l1_ratio=l1_ratio,
+                        penalizer=lambda_,
+                        l1_ratio=alpha,
                         **cox_kwargs)
                     current_cphf.fit(
                         df=iter_df[cox_cols],
@@ -99,7 +112,7 @@ def lasso_coxtabl_on_df(
                     )
                     summary = current_cphf.summary['coef']
                     for row in summary.index:
-                        l1_to_names_to_coefs[l1][row].append(summary[row])
+                        l1_to_names_to_coefs[lambda_][row].append(summary[row])
                 failed = False
             except lifelines.exceptions.ConvergenceError:
                 pass
@@ -136,9 +149,7 @@ def compute_acceptance_per_l1_df(
 
 
 def plot_acceptance_matrix(acceptance_matrix, permuted_prefix: str = 'ART'):
-    feature_relevance = (acceptance_matrix.T * (acceptance_matrix.shape[0] - numpy.arange(acceptance_matrix.shape[0]))).sum(
-        axis=1
-    ).values.argsort()
+    feature_relevance = acceptance_matrix.max(axis=0).values.argsort()
     all_features = list(acceptance_matrix.columns)
     features_sorted = [all_features[i] for i in feature_relevance]
     feature_colors = ['r' if col.startswith(permuted_prefix) else 'g' for col in features_sorted]
@@ -163,8 +174,8 @@ def compute_fdp_for_threshold(
     data_cols: List[str],
     artificial_cols: List[str],
 ):
-    nom = (max_acceptance_df.loc[data_cols] > threshold).values.sum() + 1
-    denom = max((max_acceptance_df.loc[artificial_cols] > threshold).values.sum(), 1)
+    nom = (max_acceptance_df.loc[artificial_cols] > threshold).values.sum() + 1
+    denom = max((max_acceptance_df.loc[data_cols] > threshold).values.sum(), 1)
     return nom / denom
 
 
@@ -184,7 +195,8 @@ def feature_selection(
     ) for t in thresholds]
     threshold = thresholds[numpy.array(fdps).argmin()]
     norm_selector = (max_acceptance_df > threshold).loc[data_cols]
-    selected_features = max_acceptance_df.loc[data_cols][norm_selector.values].index
+    selected_features = numpy.array(max_acceptance_df.loc[data_cols][norm_selector.values].index)
+    selected_features = list(selected_features[max_acceptance_df.loc[data_cols][norm_selector.values].values[:, 0].argsort()])
     return FeatureSelectionResult(
             thresholds,
             fdps,
@@ -218,3 +230,41 @@ def pen_l1_r_from_l1_l2(l1: float, l2: float):
     penalizer = l1 + l2
     l1_ratio = l1 / (l1 + l2)
     return penalizer, l1_ratio
+
+
+def get_optimal_lambdas(
+        times,
+        events,
+        x,
+        alpha,
+        n_lambda,
+):
+    aux_cox_vector = compute_cox_aux_vector(times, events)
+    lambda_vectors = numpy.matmul(x.T, aux_cox_vector) / (x.shape[0] * alpha)
+    lambda_max = numpy.abs(lambda_vectors).max()
+    return numpy.geomspace(lambda_max / 20, lambda_max, n_lambda)
+
+
+def compute_cox_aux_vector(
+        times, 
+        events,
+        random_seed=42, 
+        survival_time_unit=1,
+):
+    numpy.random.seed(random_seed)
+    times_perturbed = times + numpy.random.random((len(times),)) / (2 * survival_time_unit)
+    time_sorting = times_perturbed.argsort()
+
+    times_sorted = times[time_sorting]
+    events_sorted = events[time_sorting]
+
+    n = len(events_sorted)
+    r_powers_for_events = numpy.maximum(events_sorted * (n - numpy.arange(0, n)), 1) * events_sorted
+    inv_r_powers_for_events = 1 / r_powers_for_events
+    inv_r_powers_for_events[numpy.logical_not(events_sorted)] = 0
+
+    result = events_sorted.copy().astype('float')
+    result[1:] -= inv_r_powers_for_events.cumsum()[:-1]
+
+    return result[time_sorting.argsort()]
+
