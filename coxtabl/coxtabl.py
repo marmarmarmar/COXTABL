@@ -99,7 +99,6 @@ def lasso_coxtabl_on_df(
                 current_random_seed += 1
 
                 for lambda_ in lambdas:
-                    print(lambda_)
                     current_cphf = lifelines.CoxPHFitter(
                         penalizer=lambda_,
                         l1_ratio=alpha,
